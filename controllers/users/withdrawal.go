@@ -91,7 +91,7 @@ func WithdrawalHandler(w http.ResponseWriter, r *http.Request) {
 	loc, _ := time.LoadLocation("Asia/Jakarta")
 	now := time.Now().In(loc)
 	hour := now.Hour()
-	if hour < 1 || hour >= 17 {
+	if hour < 9 || hour >= 17 {
 		utils.WriteJSON(w, http.StatusBadRequest, utils.APIResponse{Success: false, Message: "Penarikan hanya dapat dilakukan pada pukul 09:00 - 17:00 WIB"})
 		return
 	}
@@ -109,7 +109,7 @@ func WithdrawalHandler(w http.ResponseWriter, r *http.Request) {
 		utils.WriteJSON(w, http.StatusInternalServerError, utils.APIResponse{Success: false, Message: "Terjadi kesalahan sistem, silakan coba lagi"})
 		return
 	}
-	if todayWithdrawals > 10 {
+	if todayWithdrawals > 0 {
 		utils.WriteJSON(w, http.StatusBadRequest, utils.APIResponse{Success: false, Message: "Anda hanya dapat melakukan 1 kali penarikan dalam sehari"})
 		return
 	}
