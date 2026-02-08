@@ -40,7 +40,7 @@ func getPakailinkConfig() (baseURL, clientKey, clientSecret, partnerID, privateK
 	terminalID = os.Getenv("PAKAILINK_TERMINAL_ID")
 
 	if baseURL == "" {
-		baseURL = "https://api.pakailink.com"
+		baseURL = "https://api.pakailink.id"
 	}
 	if clientKey == "" || clientSecret == "" || partnerID == "" || privateKeyPath == "" || callbackURL == "" {
 		return "", "", "", "", "", "", "", "", "", fmt.Errorf("PAKAILINK config wajib")
@@ -147,7 +147,7 @@ func GetPakailinkAccessToken(ctx context.Context, client *http.Client) (string, 
 	}
 	baseURL := os.Getenv("PAKAILINK_BASE_URL")
 	if baseURL == "" {
-		baseURL = "https://api.pakailink.com"
+		baseURL = "https://api.pakailink.id"
 	}
 	path := "/snap/v1.0/access-token/b2b"
 	url := strings.TrimRight(baseURL, "/") + path
