@@ -155,7 +155,7 @@ func CreateInvestmentHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var user models.User
-	if err := db.Select("level, user_mode, balance").Where("id = ?", uid).First(&user).Error; err != nil {
+	if err := db.Select("level, user_mode, balance, name").Where("id = ?", uid).First(&user).Error; err != nil {
 		utils.WriteJSON(w, http.StatusInternalServerError, utils.APIResponse{Success: false, Message: "Terjadi kesalahan, coba lagi"})
 		return
 	}
@@ -393,7 +393,11 @@ func CreateInvestmentHandler(w http.ResponseWriter, r *http.Request) {
 	} else {
 		bankCode := utils.GetVABankCode(channel)
 		customerNo := fmt.Sprintf("%d%010d", uid, time.Now().UnixNano()%10000000000)
-		vaName := fmt.Sprintf("Investasi %s", product.Name)
+		userName := strings.TrimSpace(user.Name)
+		if userName == "" {
+			userName = "Pelanggan"
+		}
+		vaName := fmt.Sprintf("%s - NovaVant", userName)
 		vaResp, err := utils.CreatePakailinkVA(r.Context(), httpClient, accessToken, orderID, customerNo, vaName, amount, bankCode)
 		if err != nil {
 			log.Printf("[Pakailink] CreatePakailinkVA error: %v", err)
