@@ -1,0 +1,1212 @@
+package users
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"math"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"project/database"
+	"project/models"
+	"project/utils"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+type CreateInvestmentRequest struct {
+	ProductID      uint   `json:"product_id"`
+	PaymentMethod  string `json:"payment_method"`
+	PaymentChannel string `json:"payment_channel"`
+}
+
+// GET /api/users/investment/active
+func GetActiveInvestmentsHandler(w http.ResponseWriter, r *http.Request) {
+	uid, ok := utils.GetUserID(r)
+	if !ok || uid == 0 {
+		utils.WriteJSON(w, http.StatusUnauthorized, utils.APIResponse{Success: false, Message: "Unauthorized"})
+		return
+	}
+	db := database.DB
+
+	// Get active categories (prioritize category ID 1)
+	var categories []models.Category
+	if err := db.Where("status = ?", "Active").Order("CASE WHEN id = 1 THEN 0 ELSE id END ASC").Find(&categories).Error; err != nil {
+		utils.WriteJSON(w, http.StatusInternalServerError, utils.APIResponse{Success: false, Message: "Gagal mengambil kategori"})
+		return
+	}
+
+	var investments []models.Investment
+	if err := db.Preload("Category").Where("user_id = ? AND status IN ?", uid, []string{"Running", "Completed", "Suspended"}).Order("CASE WHEN category_id = 1 THEN 0 ELSE category_id END ASC, product_id ASC, id DESC").Find(&investments).Error; err != nil {
+		utils.WriteJSON(w, http.StatusInternalServerError, utils.APIResponse{Success: false, Message: "Gagal mengambil investasi"})
+		return
+	}
+
+	// Group investments by category name
+	categoryMap := make(map[string][]map[string]interface{})
+	for _, inv := range investments {
+		var product models.Product
+		if err := db.Preload("Category").Where("id = ?", inv.ProductID).First(&product).Error; err != nil {
+			continue
+		}
+
+		catName := ""
+		if inv.Category != nil {
+			catName = inv.Category.Name
+		}
+
+		// Prepare product category info
+		var productCategory map[string]interface{}
+		if product.Category != nil {
+			productCategory = map[string]interface{}{
+				"id":          product.Category.ID,
+				"name":        product.Category.Name,
+				"status":      product.Category.Status,
+				"profit_type": product.Category.ProfitType,
+			}
+		}
+
+		m := map[string]interface{}{
+			"id":               inv.ID,
+			"user_id":          inv.UserID,
+			"product_id":       inv.ProductID,
+			"product_name":     product.Name,
+			"product_category": productCategory,
+			"category_id":      inv.CategoryID,
+			"category_name":    catName,
+			"amount":           int64(inv.Amount),
+			"duration":         inv.Duration,
+			"daily_profit":     int64(inv.DailyProfit),
+			"total_paid":       inv.TotalPaid,
+			"total_returned":   int64(inv.TotalReturned),
+			"last_return_at":   inv.LastReturnAt,
+			"next_return_at":   inv.NextReturnAt,
+			"order_id":         inv.OrderID,
+			"status":           inv.Status,
+		}
+		categoryMap[catName] = append(categoryMap[catName], m)
+	}
+
+	// Ensure all categories exist in response
+	resp := make(map[string]interface{})
+	for _, cat := range categories {
+		if invs, ok := categoryMap[cat.Name]; ok {
+			resp[cat.Name] = invs
+		} else {
+			resp[cat.Name] = []map[string]interface{}{}
+		}
+	}
+
+	utils.WriteJSON(w, http.StatusOK, utils.APIResponse{Success: true, Message: "Successfully", Data: resp})
+}
+
+// POST /api/users/investments - FIXED VERSION
+func CreateInvestmentHandler(w http.ResponseWriter, r *http.Request) {
+	var req CreateInvestmentRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		utils.WriteJSON(w, http.StatusBadRequest, utils.APIResponse{Success: false, Message: "Not valid JSON"})
+		return
+	}
+
+	uid, ok := utils.GetUserID(r)
+	if !ok || uid == 0 {
+		utils.WriteJSON(w, http.StatusUnauthorized, utils.APIResponse{Success: false, Message: "Unauthorized"})
+		return
+	}
+
+	method := strings.ToUpper(strings.TrimSpace(req.PaymentMethod))
+	channel := strings.ToUpper(strings.TrimSpace(req.PaymentChannel))
+	if method != "QRIS" && method != "BANK" {
+		utils.WriteJSON(w, http.StatusBadRequest, utils.APIResponse{Success: false, Message: "Silahkan pilih metode pembayaran"})
+		return
+	}
+	if method == "BANK" {
+		allowed := map[string]struct{}{
+			"BCA": {}, "BNI": {}, "BRI": {}, "BSI": {}, "CIMB": {}, "DANAMON": {},
+			"MANDIRI": {}, "BMI": {}, "BNC": {}, "OCBC": {}, "PERMATA": {}, "SINARMAS": {},
+		}
+		if _, ok := allowed[channel]; !ok {
+			utils.WriteJSON(w, http.StatusBadRequest, utils.APIResponse{Success: false, Message: "Bank tidak valid"})
+			return
+		}
+	}
+
+	db := database.DB
+	var product models.Product
+	if err := db.Preload("Category").Where("id = ? AND status = 'Active'", req.ProductID).First(&product).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			utils.WriteJSON(w, http.StatusBadRequest, utils.APIResponse{Success: false, Message: "Produk tidak ditemukan"})
+			return
+		}
+		utils.WriteJSON(w, http.StatusInternalServerError, utils.APIResponse{Success: false, Message: "Terjadi kesalahan, coba lagi"})
+		return
+	}
+
+	if product.Category == nil {
+		utils.WriteJSON(w, http.StatusBadRequest, utils.APIResponse{Success: false, Message: "Kategori produk tidak valid"})
+		return
+	}
+
+	var user models.User
+	if err := db.Select("level, user_mode, balance").Where("id = ?", uid).First(&user).Error; err != nil {
+		utils.WriteJSON(w, http.StatusInternalServerError, utils.APIResponse{Success: false, Message: "Terjadi kesalahan, coba lagi"})
+		return
+	}
+
+	userLevel := uint(0)
+	if user.Level != nil {
+		userLevel = *user.Level
+	}
+
+	if userLevel < uint(product.RequiredVIP) {
+		msg := fmt.Sprintf("Produk %s memerlukan VIP level %d. Level VIP Anda saat ini: %d", product.Name, product.RequiredVIP, userLevel)
+		utils.WriteJSON(w, http.StatusBadRequest, utils.APIResponse{Success: false, Message: msg})
+		return
+	}
+
+	if product.PurchaseLimit > 0 {
+		var purchaseCount int64
+		if err := db.Model(&models.Investment{}).
+			Where("user_id = ? AND product_id = ? AND status IN ?", uid, product.ID, []string{"Running", "Completed", "Suspended"}).
+			Count(&purchaseCount).Error; err != nil {
+			utils.WriteJSON(w, http.StatusInternalServerError, utils.APIResponse{Success: false, Message: "Terjadi kesalahan, coba lagi"})
+			return
+		}
+		if purchaseCount >= int64(product.PurchaseLimit) {
+			msg := fmt.Sprintf("Anda telah mencapai batas pembelian untuk produk %s (maksimal %dx)", product.Name, product.PurchaseLimit)
+			utils.WriteJSON(w, http.StatusBadRequest, utils.APIResponse{Success: false, Message: msg})
+			return
+		}
+	}
+
+	amount := product.Amount
+	daily := product.DailyProfit
+	orderID := utils.GenerateOrderID(uid)
+	referenceID := orderID
+
+	// Check if user is promotor
+	isPromotor := user.UserMode == "promotor"
+
+	// Sentinel error for insufficient balance
+	var errInsufficientBalance = errors.New("insufficient_balance")
+
+	if isPromotor {
+		// For promotor: check balance and process directly without payment gateway
+		if user.Balance < amount {
+			utils.WriteJSON(w, http.StatusBadRequest, utils.APIResponse{Success: false, Message: "Saldo tidak mencukupi"})
+			return
+		}
+
+		inv := models.Investment{
+			UserID:        uid,
+			ProductID:     product.ID,
+			CategoryID:    product.CategoryID,
+			Amount:        amount,
+			DailyProfit:   daily,
+			Duration:      product.Duration,
+			TotalPaid:     0,
+			TotalReturned: 0,
+			OrderID:       orderID,
+			Status:        "Pending",
+		}
+
+		if err := db.Transaction(func(tx *gorm.DB) error {
+			// Lock user row for update
+			var lockedUser models.User
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&lockedUser, uid).Error; err != nil {
+				return err
+			}
+			if lockedUser.Balance < amount {
+				return errInsufficientBalance
+			}
+
+			// Deduct balance
+			newBalance := round3(lockedUser.Balance - amount)
+			if err := tx.Model(&lockedUser).Update("balance", newBalance).Error; err != nil {
+				return err
+			}
+
+			// Create investment
+			if err := tx.Create(&inv).Error; err != nil {
+				return err
+			}
+
+			// Create payment record (for promotor, mark as Success immediately)
+			methodToSave := strings.ToUpper(method)
+			payment := models.Payment{
+				InvestmentID: inv.ID,
+				ReferenceID: func() *string {
+					x := referenceID
+					return &x
+				}(),
+				OrderID:       inv.OrderID,
+				PaymentMethod: &methodToSave,
+				PaymentChannel: func() *string {
+					if methodToSave == "BANK" {
+						return &channel
+					}
+					return nil
+				}(),
+				Status: "Success",
+			}
+			if err := tx.Create(&payment).Error; err != nil {
+				return err
+			}
+
+			// Create transaction (Success immediately for promotor)
+			msg := fmt.Sprintf("Investasi %s", product.Name)
+			trx := models.Transaction{
+				UserID:          uid,
+				Amount:          inv.Amount,
+				Charge:          0,
+				OrderID:         inv.OrderID,
+				TransactionFlow: "credit",
+				TransactionType: "investment",
+				Message:         &msg,
+				Status:          "Success",
+			}
+			if err := tx.Create(&trx).Error; err != nil {
+				return err
+			}
+
+			// Update investment to Running
+			now := time.Now()
+			next := now.Add(24 * time.Hour)
+			updates := map[string]interface{}{
+				"status":         "Running",
+				"last_return_at": nil,
+				"next_return_at": next,
+			}
+			if err := tx.Model(&inv).Updates(updates).Error; err != nil {
+				return err
+			}
+
+			// Get category info to determine if this is Monitor (locked profit)
+			var category models.Category
+			isMonitor := false
+			if err := tx.Where("id = ?", inv.CategoryID).First(&category).Error; err == nil {
+				if category.ProfitType == "locked" {
+					isMonitor = true
+				}
+			}
+
+			// Update user total_invest and total_invest_vip
+			userUpdates := map[string]interface{}{
+				"total_invest":      gorm.Expr("total_invest + ?", inv.Amount),
+				"investment_status": "Active",
+			}
+			if isMonitor {
+				userUpdates["total_invest_vip"] = gorm.Expr("total_invest_vip + ?", inv.Amount)
+			}
+			if err := tx.Model(&models.User{}).Where("id = ?", inv.UserID).Updates(userUpdates).Error; err != nil {
+				return err
+			}
+
+			// Calculate VIP level based on total_invest_vip for locked categories
+			if isMonitor {
+				var updatedUser models.User
+				if err := tx.Model(&models.User{}).Select("total_invest_vip").Where("id = ?", inv.UserID).First(&updatedUser).Error; err == nil {
+					newLevel := calculateVIPLevel(updatedUser.TotalInvestVIP)
+					if err := tx.Model(&models.User{}).Where("id = ?", inv.UserID).Update("level", newLevel).Error; err != nil {
+						return err
+					}
+				}
+			}
+
+			// Untuk mode promotor: TIDAK memberikan bonus rekomendasi dan spin ticket
+			// Bonus hanya diberikan untuk mode real
+
+			return nil
+		}); err != nil {
+			if errors.Is(err, errInsufficientBalance) {
+				utils.WriteJSON(w, http.StatusBadRequest, utils.APIResponse{Success: false, Message: "Saldo tidak mencukupi"})
+				return
+			}
+			utils.WriteJSON(w, http.StatusInternalServerError, utils.APIResponse{Success: false, Message: "Gagal membuat investasi"})
+			return
+		}
+
+		// Reload investment to get updated status
+		db.First(&inv, inv.ID)
+
+		resp := map[string]interface{}{
+			"order_id":     inv.OrderID,
+			"amount":       inv.Amount,
+			"product":      product.Name,
+			"category":     product.Category.Name,
+			"category_id":  product.CategoryID,
+			"duration":     product.Duration,
+			"daily_profit": daily,
+			"status":       inv.Status,
+		}
+		utils.WriteJSON(w, http.StatusCreated, utils.APIResponse{Success: true, Message: "Investasi berhasil diproses", Data: resp})
+		return
+	}
+
+	// For real users: use Pakailink payment gateway
+	httpClient := &http.Client{Timeout: 30 * time.Second}
+
+	accessToken, err := utils.GetPakailinkAccessToken(r.Context(), httpClient)
+	if err != nil {
+		log.Printf("[Pakailink] GetPakailinkAccessToken error: %v", err)
+		utils.WriteJSON(w, http.StatusBadRequest, utils.APIResponse{Success: false, Message: "Terjadi kesalahan saat memanggil layanan pembayaran"})
+		return
+	}
+
+	if method == "QRIS" && amount > 10000000 {
+		utils.WriteJSON(w, http.StatusBadRequest, utils.APIResponse{Success: false, Message: "Jumlah pembayaran maksimal menggunakan QRIS adalah Rp 10.000.000, Silahkan gunakan metode pembayaran lain"})
+		return
+	}
+
+	if method == "BANK" && amount < 10000 {
+		utils.WriteJSON(w, http.StatusBadRequest, utils.APIResponse{Success: false, Message: "Jumlah pembayaran minimal menggunakan BANK adalah Rp 10.000, Silahkan gunakan metode pembayaran lain"})
+		return
+	}
+
+	var paymentCode string
+	var expiredAt time.Time
+
+	if method == "QRIS" {
+		qrResp, err := utils.CreatePakailinkQRIS(r.Context(), httpClient, accessToken, orderID, amount)
+		if err != nil {
+			log.Printf("[Pakailink] CreatePakailinkQRIS error: %v", err)
+			utils.WriteJSON(w, http.StatusBadRequest, utils.APIResponse{Success: false, Message: "Terjadi kesalahan saat memanggil layanan pembayaran"})
+			return
+		}
+		paymentCode = qrResp.QRContent
+		if qrResp.ValidityPeriod != "" {
+			if t, err := time.Parse(time.RFC3339, qrResp.ValidityPeriod); err == nil {
+				expiredAt = t
+			} else {
+				expiredAt = time.Now().Add(24 * time.Hour)
+			}
+		} else {
+			expiredAt = time.Now().Add(24 * time.Hour)
+		}
+	} else {
+		bankCode := utils.GetVABankCode(channel)
+		customerNo := fmt.Sprintf("%d%010d", uid, time.Now().UnixNano()%10000000000)
+		vaName := fmt.Sprintf("Investasi %s", product.Name)
+		vaResp, err := utils.CreatePakailinkVA(r.Context(), httpClient, accessToken, orderID, customerNo, vaName, amount, bankCode)
+		if err != nil {
+			log.Printf("[Pakailink] CreatePakailinkVA error: %v", err)
+			utils.WriteJSON(w, http.StatusBadRequest, utils.APIResponse{Success: false, Message: "Terjadi kesalahan saat memanggil layanan pembayaran"})
+			return
+		}
+		paymentCode = vaResp.VirtualAccountData.VirtualAccountNo
+		if vaResp.VirtualAccountData.ExpiredDate != "" {
+			if t, err := time.Parse("2006-01-02T15:04:05-07:00", vaResp.VirtualAccountData.ExpiredDate); err == nil {
+				expiredAt = t
+			} else {
+				expiredAt = time.Now().Add(24 * time.Hour)
+			}
+		} else {
+			expiredAt = time.Now().Add(24 * time.Hour)
+		}
+	}
+
+	inv := models.Investment{
+		UserID:        uid,
+		ProductID:     product.ID,
+		CategoryID:    product.CategoryID,
+		Amount:        amount,
+		DailyProfit:   daily,
+		Duration:      product.Duration,
+		TotalPaid:     0,
+		TotalReturned: 0,
+		OrderID:       orderID,
+		Status:        "Pending",
+	}
+
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&inv).Error; err != nil {
+			return err
+		}
+
+		methodToSave := strings.ToUpper(method)
+		pc := strings.TrimSpace(paymentCode)
+		expAt := expiredAt
+
+		payment := models.Payment{
+			InvestmentID: inv.ID,
+			ReferenceID: func() *string {
+				x := referenceID
+				return &x
+			}(),
+			OrderID:       inv.OrderID,
+			PaymentMethod: &methodToSave,
+			PaymentChannel: func() *string {
+				if methodToSave == "BANK" {
+					return &channel
+				}
+				return nil
+			}(),
+			PaymentCode: func() *string {
+				if pc != "" {
+					return &pc
+				}
+				return nil
+			}(),
+			PaymentLink: nil, // Pakailink tidak menyediakan checkout URL
+			Status:      "Pending",
+			ExpiredAt:   &expAt,
+		}
+
+		if err := tx.Create(&payment).Error; err != nil {
+			return err
+		}
+
+		msg := fmt.Sprintf("Investasi %s", product.Name)
+		trx := models.Transaction{
+			UserID:          uid,
+			Amount:          inv.Amount,
+			Charge:          0,
+			OrderID:         inv.OrderID,
+			TransactionFlow: "credit",
+			TransactionType: "investment",
+			Message:         &msg,
+			Status:          "Pending",
+		}
+		if err := tx.Create(&trx).Error; err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		utils.WriteJSON(w, http.StatusInternalServerError, utils.APIResponse{Success: false, Message: "Gagal membuat investasi"})
+		return
+	}
+
+	resp := map[string]interface{}{
+		"order_id":     inv.OrderID,
+		"amount":       inv.Amount,
+		"product":      product.Name,
+		"category":     product.Category.Name,
+		"category_id":  product.CategoryID,
+		"duration":     product.Duration,
+		"daily_profit": daily,
+		"status":       inv.Status,
+	}
+	utils.WriteJSON(w, http.StatusCreated, utils.APIResponse{Success: true, Message: "Pembelian berhasil, silakan lakukan pembayaran", Data: resp})
+}
+
+// GET /api/users/investments
+func ListInvestmentsHandler(w http.ResponseWriter, r *http.Request) {
+	uid, ok := utils.GetUserID(r)
+	if !ok || uid == 0 {
+		utils.WriteJSON(w, http.StatusUnauthorized, utils.APIResponse{Success: false, Message: "Unauthorized"})
+		return
+	}
+
+	// Get query parameters
+	pageStr := r.URL.Query().Get("page")
+	limitStr := r.URL.Query().Get("limit")
+	searchQuery := strings.TrimSpace(r.URL.Query().Get("search"))
+
+	// Parse pagination with defaults
+	page, _ := strconv.Atoi(pageStr)
+	if page < 1 {
+		page = 1
+	}
+	limit, _ := strconv.Atoi(limitStr)
+	if limit < 1 {
+		limit = 10
+	}
+
+	db := database.DB
+
+	// Build base query for counting
+	countQuery := db.Model(&models.Investment{}).Where("user_id = ?", uid)
+	if searchQuery != "" {
+		countQuery = countQuery.Where("order_id LIKE ?", "%"+searchQuery+"%")
+	}
+
+	// Count total rows
+	var totalRows int64
+	if err := countQuery.Count(&totalRows).Error; err != nil {
+		utils.WriteJSON(w, http.StatusInternalServerError, utils.APIResponse{Success: false, Message: "Terjadi kesalahan"})
+		return
+	}
+
+	// Calculate pagination
+	totalPages := int(math.Ceil(float64(totalRows) / float64(limit)))
+	offset := (page - 1) * limit
+
+	// Build query for fetching data
+	var rows []models.Investment
+	query := db.Where("user_id = ?", uid)
+	if searchQuery != "" {
+		query = query.Where("order_id LIKE ?", "%"+searchQuery+"%")
+	}
+	if err := query.Order("id DESC").Limit(limit).Offset(offset).Find(&rows).Error; err != nil {
+		utils.WriteJSON(w, http.StatusInternalServerError, utils.APIResponse{Success: false, Message: "Terjadi kesalahan"})
+		return
+	}
+
+	// Get order IDs for payment lookup
+	orderIDs := make([]string, 0, len(rows))
+	productIDs := make([]uint, 0, len(rows))
+	for _, inv := range rows {
+		orderIDs = append(orderIDs, inv.OrderID)
+		productIDs = append(productIDs, inv.ProductID)
+	}
+
+	// Fetch payments to get expired_at
+	var payments []models.Payment
+	paymentMap := make(map[string]*models.Payment)
+	if len(orderIDs) > 0 {
+		db.Where("order_id IN ?", orderIDs).Find(&payments)
+		for i := range payments {
+			paymentMap[payments[i].OrderID] = &payments[i]
+		}
+	}
+
+	// Fetch products to get product names
+	var products []models.Product
+	productMap := make(map[uint]string)
+	if len(productIDs) > 0 {
+		db.Where("id IN ?", productIDs).Find(&products)
+		for _, product := range products {
+			productMap[product.ID] = product.Name
+		}
+	}
+
+	// Check and update expired investments
+	now := time.Now()
+	for i := range rows {
+		inv := &rows[i]
+		if inv.Status == "Pending" {
+			if payment, ok := paymentMap[inv.OrderID]; ok && payment.ExpiredAt != nil {
+				if payment.ExpiredAt.Before(now) || payment.ExpiredAt.Equal(now) {
+					// Update payment and investment status to expired/cancelled
+					tx := db.Begin()
+					if err := tx.Model(&models.Payment{}).Where("order_id = ?", inv.OrderID).Update("status", "Expired").Error; err == nil {
+						if err := tx.Model(&models.Investment{}).Where("id = ?", inv.ID).Update("status", "Cancelled").Error; err == nil {
+							if err := tx.Model(&models.Transaction{}).Where("order_id = ?", inv.OrderID).Update("status", "Failed").Error; err == nil {
+								tx.Commit()
+								// Update local data
+								inv.Status = "Cancelled"
+							} else {
+								tx.Rollback()
+							}
+						} else {
+							tx.Rollback()
+						}
+					} else {
+						tx.Rollback()
+					}
+				}
+			}
+		}
+	}
+
+	// Build response with expired_at from payment, product name, and status from payment
+	type InvestmentResponse struct {
+		ID            uint       `json:"id"`
+		UserID        uint       `json:"user_id"`
+		ProductID     uint       `json:"product_id"`
+		CategoryID    uint       `json:"category_id"`
+		Amount        float64    `json:"amount"`
+		DailyProfit   float64    `json:"daily_profit"`
+		Duration      int        `json:"duration"`
+		TotalPaid     int        `json:"total_paid"`
+		TotalReturned float64    `json:"total_returned"`
+		LastReturnAt  *time.Time `json:"last_return_at,omitempty"`
+		NextReturnAt  *time.Time `json:"next_return_at,omitempty"`
+		OrderID       string     `json:"order_id"`
+		Status        string     `json:"status"` // Status from payment
+		CreatedAt     time.Time  `json:"created_at"`
+		UpdatedAt     time.Time  `json:"updated_at"`
+		ExpiredAt     *string    `json:"expired_at,omitempty"`
+		Product       *string    `json:"product,omitempty"`
+	}
+	responseRows := make([]InvestmentResponse, 0, len(rows))
+	for _, inv := range rows {
+		item := InvestmentResponse{
+			ID:            inv.ID,
+			UserID:        inv.UserID,
+			ProductID:     inv.ProductID,
+			CategoryID:    inv.CategoryID,
+			Amount:        inv.Amount,
+			DailyProfit:   inv.DailyProfit,
+			Duration:      inv.Duration,
+			TotalPaid:     inv.TotalPaid,
+			TotalReturned: inv.TotalReturned,
+			LastReturnAt:  inv.LastReturnAt,
+			NextReturnAt:  inv.NextReturnAt,
+			OrderID:       inv.OrderID,
+			Status:        inv.Status, // Default to investment status
+			CreatedAt:     inv.CreatedAt,
+			UpdatedAt:     inv.UpdatedAt,
+		}
+
+		// Get status from payment if payment exists
+		if payment, ok := paymentMap[inv.OrderID]; ok {
+			item.Status = payment.Status
+			if payment.ExpiredAt != nil {
+				expiredStr := payment.ExpiredAt.UTC().Format(time.RFC3339)
+				item.ExpiredAt = &expiredStr
+			}
+		}
+
+		if productName, ok := productMap[inv.ProductID]; ok {
+			item.Product = &productName
+		}
+		responseRows = append(responseRows, item)
+	}
+
+	// Build response with pagination
+	responseData := map[string]interface{}{
+		"data": responseRows,
+		"pagination": map[string]interface{}{
+			"page":        page,
+			"limit":       limit,
+			"total_rows":  totalRows,
+			"total_pages": totalPages,
+		},
+	}
+
+	utils.WriteJSON(w, http.StatusOK, utils.APIResponse{Success: true, Message: "Successfully", Data: responseData})
+}
+
+// GET /api/users/investments/{id}
+func GetInvestmentHandler(w http.ResponseWriter, r *http.Request) {
+	uid, ok := utils.GetUserID(r)
+	if !ok || uid == 0 {
+		utils.WriteJSON(w, http.StatusUnauthorized, utils.APIResponse{Success: false, Message: "Unauthorized"})
+		return
+	}
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	var idStr string
+	if len(parts) >= 4 {
+		idStr = parts[3]
+	}
+	id64, err := strconv.ParseUint(idStr, 10, 64)
+	if err != nil || id64 == 0 {
+		utils.WriteJSON(w, http.StatusBadRequest, utils.APIResponse{Success: false, Message: "ID tidak valid"})
+		return
+	}
+	db := database.DB
+	var row models.Investment
+	if err := db.Where("id = ? AND user_id = ?", uint(id64), uid).First(&row).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			utils.WriteJSON(w, http.StatusNotFound, utils.APIResponse{Success: false, Message: "Data tidak ditemukan"})
+			return
+		}
+		utils.WriteJSON(w, http.StatusInternalServerError, utils.APIResponse{Success: false, Message: "Terjadi kesalahan"})
+		return
+	}
+	utils.WriteJSON(w, http.StatusOK, utils.APIResponse{Success: true, Message: "Successfully", Data: row})
+}
+
+// GET /api/users/payment/{order_id}
+func GetPaymentDetailsHandler(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	var orderID string
+	if len(parts) >= 3 {
+		orderID = parts[len(parts)-1]
+	}
+
+	db := database.DB
+	var payment models.Payment
+	if err := db.Where("order_id = ?", orderID).First(&payment).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			utils.WriteJSON(w, http.StatusNotFound, utils.APIResponse{Success: false, Message: "Data pembayaran tidak ditemukan"})
+			return
+		}
+		utils.WriteJSON(w, http.StatusInternalServerError, utils.APIResponse{Success: false, Message: "Terjadi kesalahan"})
+		return
+	}
+
+	var inv models.Investment
+	if err := db.Where("id = ?", payment.InvestmentID).First(&inv).Error; err != nil {
+		utils.WriteJSON(w, http.StatusInternalServerError, utils.APIResponse{Success: false, Message: "Terjadi kesalahan mengambil data investasi"})
+		return
+	}
+
+	// Inquiry Pakailink status when payment is Pending and not expired (validasi cek)
+	now := time.Now()
+	if payment.Status == "Pending" && inv.Status == "Pending" && payment.ExpiredAt != nil && payment.ExpiredAt.After(now) {
+		httpClient := &http.Client{Timeout: 10 * time.Second}
+		accessToken, err := utils.GetPakailinkAccessToken(r.Context(), httpClient)
+		if err == nil {
+			var paid bool
+			method := ""
+			if payment.PaymentMethod != nil {
+				method = *payment.PaymentMethod
+			}
+			if method == "BANK" {
+				res, err := utils.InquiryPakailinkVAStatus(r.Context(), httpClient, accessToken, orderID)
+				if err == nil && utils.IsPakailinkSuccessStatus(res.LatestTransactionStatus) {
+					paid = true
+				}
+			} else if method == "QRIS" {
+				res, err := utils.InquiryPakailinkQRStatus(r.Context(), httpClient, accessToken, orderID)
+				if err == nil && utils.IsPakailinkSuccessStatus(res.LatestTransactionStatus) {
+					paid = true
+				}
+			}
+			if paid {
+				_ = db.Model(&payment).Update("status", "Success").Error
+				_ = db.Transaction(func(tx *gorm.DB) error {
+					return processInvestmentPaymentSuccess(tx, &inv)
+				})
+				db.Where("id = ?", payment.ID).First(&payment)
+				db.Where("id = ?", inv.ID).First(&inv)
+			}
+		}
+	}
+
+	var product models.Product
+	if err := db.Select("name").Where("id = ?", inv.ProductID).First(&product).Error; err != nil {
+		utils.WriteJSON(w, http.StatusInternalServerError, utils.APIResponse{Success: false, Message: "Terjadi kesalahan mengambil data produk"})
+		return
+	}
+	resp := map[string]interface{}{
+		"product":  product.Name,
+		"order_id": payment.OrderID,
+		"amount":   inv.Amount,
+		"payment_code": func() interface{} {
+			if payment.PaymentCode == nil {
+				return nil
+			}
+			return *payment.PaymentCode
+		}(),
+		"payment_channel": func() interface{} {
+			if payment.PaymentChannel == nil {
+				return nil
+			}
+			return *payment.PaymentChannel
+		}(),
+		"payment_method": func() interface{} {
+			if payment.PaymentMethod == nil {
+				return nil
+			}
+			return *payment.PaymentMethod
+		}(),
+		"expired_at": func() interface{} {
+			if payment.ExpiredAt == nil {
+				return nil
+			}
+			return payment.ExpiredAt.UTC().Format(time.RFC3339)
+		}(),
+		"status": payment.Status,
+	}
+
+	utils.WriteJSON(w, http.StatusOK, utils.APIResponse{Success: true, Message: "Successfully", Data: resp})
+}
+
+// processInvestmentPaymentSuccess updates transaction, investment, user, and referral bonus when payment succeeds
+func processInvestmentPaymentSuccess(tx *gorm.DB, inv *models.Investment) error {
+	now := time.Now()
+	next := now.Add(24 * time.Hour)
+	if err := tx.Model(&models.Transaction{}).Where("order_id = ?", inv.OrderID).Updates(map[string]interface{}{"status": "Success"}).Error; err != nil {
+		return err
+	}
+	if err := tx.Model(inv).Updates(map[string]interface{}{"status": "Running", "last_return_at": nil, "next_return_at": next}).Error; err != nil {
+		return err
+	}
+	var category models.Category
+	isMonitor := false
+	if err := tx.Where("id = ?", inv.CategoryID).First(&category).Error; err == nil && category.ProfitType == "locked" {
+		isMonitor = true
+	}
+	userUpdates := map[string]interface{}{
+		"total_invest":      gorm.Expr("total_invest + ?", inv.Amount),
+		"investment_status": "Active",
+	}
+	if isMonitor {
+		userUpdates["total_invest_vip"] = gorm.Expr("total_invest_vip + ?", inv.Amount)
+	}
+	if err := tx.Model(&models.User{}).Where("id = ?", inv.UserID).Updates(userUpdates).Error; err != nil {
+		return err
+	}
+	if isMonitor {
+		var user models.User
+		if err := tx.Model(&models.User{}).Select("total_invest_vip").Where("id = ?", inv.UserID).First(&user).Error; err == nil {
+			newLevel := calculateVIPLevel(user.TotalInvestVIP)
+			_ = tx.Model(&models.User{}).Where("id = ?", inv.UserID).Update("level", newLevel).Error
+		}
+	}
+	var user models.User
+	if err := tx.Select("id, reff_by").Where("id = ?", inv.UserID).First(&user).Error; err == nil && user.ReffBy != nil {
+		var level1 models.User
+		if err := tx.Select("id, spin_ticket").Where("id = ?", *user.ReffBy).First(&level1).Error; err == nil && isMonitor {
+			if inv.Amount >= 100000 {
+				if level1.SpinTicket == nil {
+					one := uint(1)
+					tx.Model(&models.User{}).Where("id = ?", level1.ID).Update("spin_ticket", one)
+				} else {
+					tx.Model(&models.User{}).Where("id = ?", level1.ID).UpdateColumn("spin_ticket", gorm.Expr("spin_ticket + 1"))
+				}
+			}
+			bonus := round3(inv.Amount * 0.30)
+			tx.Model(&models.User{}).Where("id = ?", level1.ID).UpdateColumn("balance", gorm.Expr("balance + ?", bonus))
+			msg := "Bonus rekomendasi investor"
+			trx := models.Transaction{
+				UserID:          level1.ID,
+				Amount:          bonus,
+				Charge:          0,
+				OrderID:         utils.GenerateOrderID(level1.ID),
+				TransactionFlow: "debit",
+				TransactionType: "team",
+				Message:         &msg,
+				Status:          "Success",
+			}
+			tx.Create(&trx)
+		}
+	}
+	return nil
+}
+
+// PakailinkCallbackPayload handles both VA and QR callbacks
+type PakailinkCallbackPayload struct {
+	// VA callback format
+	TransactionData *struct {
+		PartnerReferenceNo string `json:"partnerReferenceNo"`
+		CallbackType       string `json:"callbackType"`
+		PaymentFlagStatus  string `json:"paymentFlagStatus"`
+	} `json:"transactionData"`
+	// QR callback format (at root)
+	OriginalPartnerReferenceNo string `json:"originalPartnerReferenceNo"`
+	CallbackType               string `json:"callbackType"`
+	LatestTransactionStatus    string `json:"latestTransactionStatus"`
+}
+
+// PakailinkWebhookHandler handles PakaiLink VA and QRIS callbacks
+// callbackType: "payment" = process, "settlement" = return success without processing
+func PakailinkWebhookHandler(w http.ResponseWriter, r *http.Request) {
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		utils.WriteJSON(w, http.StatusBadRequest, utils.APIResponse{Success: false, Message: "Invalid body"})
+		return
+	}
+
+	var payload PakailinkCallbackPayload
+	if err := json.Unmarshal(bodyBytes, &payload); err != nil {
+		utils.WriteJSON(w, http.StatusBadRequest, utils.APIResponse{Success: false, Message: "Invalid JSON"})
+		return
+	}
+
+	// Determine callbackType and partnerReferenceNo
+	var callbackType, partnerRefNo, status string
+	if payload.TransactionData != nil {
+		// VA callback
+		callbackType = strings.TrimSpace(payload.TransactionData.CallbackType)
+		partnerRefNo = strings.TrimSpace(payload.TransactionData.PartnerReferenceNo)
+		status = strings.TrimSpace(payload.TransactionData.PaymentFlagStatus)
+	} else {
+		// QR callback
+		callbackType = strings.TrimSpace(payload.CallbackType)
+		partnerRefNo = strings.TrimSpace(payload.OriginalPartnerReferenceNo)
+		status = strings.TrimSpace(payload.LatestTransactionStatus)
+	}
+
+	// settlement: return success without processing
+	if strings.ToLower(callbackType) == "settlement" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"responseCode":"2002800","responseMessage":"Successful"}`))
+		return
+	}
+
+	// payment: process only if callbackType is payment
+	if strings.ToLower(callbackType) != "payment" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"responseCode":"2002800","responseMessage":"Successful"}`))
+		return
+	}
+
+	if partnerRefNo == "" {
+		utils.WriteJSON(w, http.StatusBadRequest, utils.APIResponse{Success: false, Message: "partnerReferenceNo kosong"})
+		return
+	}
+
+	success := status == "00"
+
+	db := database.DB
+
+	var payment models.Payment
+	if err := db.Where("order_id = ?", partnerRefNo).First(&payment).Error; err != nil {
+		utils.WriteJSON(w, http.StatusNotFound, utils.APIResponse{Success: false, Message: "Pembayaran tidak ditemukan"})
+		return
+	}
+
+	paymentUpdates := map[string]interface{}{}
+	if success {
+		paymentUpdates["status"] = "Success"
+	} else {
+		paymentUpdates["status"] = "Failed"
+	}
+	if len(paymentUpdates) > 0 {
+		_ = db.Model(&payment).Updates(paymentUpdates).Error
+	}
+
+	var inv models.Investment
+	if err := db.Where("id = ?", payment.InvestmentID).First(&inv).Error; err != nil {
+		utils.WriteJSON(w, http.StatusNotFound, utils.APIResponse{Success: false, Message: "Investasi tidak ditemukan"})
+		return
+	}
+
+	if inv.Status != "Pending" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"responseCode":"2002800","responseMessage":"Successful"}`))
+		return
+	}
+
+	writePakailinkCallbackSuccess := func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"responseCode":"2002800","responseMessage":"Successful"}`))
+	}
+
+	if success {
+		_ = db.Transaction(func(tx *gorm.DB) error {
+			return processInvestmentPaymentSuccess(tx, &inv)
+		})
+		writePakailinkCallbackSuccess(w)
+		return
+	}
+
+	_ = db.Transaction(func(tx *gorm.DB) error {
+		_ = tx.Model(&models.Transaction{}).Where("order_id = ?", inv.OrderID).Update("status", "Failed").Error
+		_ = tx.Model(&inv).Update("status", "Cancelled").Error
+		return nil
+	})
+	writePakailinkCallbackSuccess(w)
+}
+
+// POST /api/cron/daily-returns
+func CronDailyReturnsHandler(w http.ResponseWriter, r *http.Request) {
+	key := r.Header.Get("X-CRON-KEY")
+	if key == "" || key != os.Getenv("CRON_KEY") {
+		utils.WriteJSON(w, http.StatusUnauthorized, utils.APIResponse{Success: false, Message: "Unauthorized"})
+		return
+	}
+
+	db := database.DB
+	now := time.Now()
+	var due []models.Investment
+	if err := db.Where("status = 'Running' AND next_return_at IS NOT NULL AND next_return_at <= ? AND total_paid < duration", now).Find(&due).Error; err != nil {
+		utils.WriteJSON(w, http.StatusInternalServerError, utils.APIResponse{Success: false, Message: "Terjadi kesalahan"})
+		return
+	}
+	processed := 0
+	for i := range due {
+		inv := due[i]
+		_ = db.Transaction(func(tx *gorm.DB) error {
+			var user models.User
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&user, inv.UserID).Error; err != nil {
+				return err
+			}
+
+			// Get category to check profit type
+			var category models.Category
+			if err := tx.Where("id = ?", inv.CategoryID).First(&category).Error; err != nil {
+				return err
+			}
+
+			amount := inv.DailyProfit
+			paid := inv.TotalPaid + 1
+			returned := round3(inv.TotalReturned + amount)
+
+			var product models.Product
+			if err := tx.Where("id = ?", inv.ProductID).First(&product).Error; err != nil {
+				return err
+			}
+
+			// For locked (Monitor) category: Don't pay to balance until completion, just accumulate
+			// For unlocked (Insight/AutoPilot): Pay to balance immediately
+			if category.ProfitType == "unlocked" {
+				newBalance := round3(user.Balance + amount)
+				if err := tx.Model(&user).Update("balance", newBalance).Error; err != nil {
+					return err
+				}
+
+				orderID := utils.GenerateOrderID(inv.UserID)
+				msg := fmt.Sprintf("Profit investasi produk %s", product.Name)
+				trx := models.Transaction{
+					UserID:          inv.UserID,
+					Amount:          amount,
+					Charge:          0,
+					OrderID:         orderID,
+					TransactionFlow: "debit",
+					TransactionType: "return",
+					Message:         &msg,
+					Status:          "Success",
+				}
+				if err := tx.Create(&trx).Error; err != nil {
+					return err
+				}
+			}
+
+			// For locked (Monitor): If completing, pay total accumulated profit
+			if category.ProfitType == "locked" && paid >= inv.Duration {
+				totalProfit := round3(inv.DailyProfit * float64(inv.Duration))
+				newBalance := round3(user.Balance + totalProfit)
+				if err := tx.Model(&user).Update("balance", newBalance).Error; err != nil {
+					return err
+				}
+
+				orderID := utils.GenerateOrderID(inv.UserID)
+				msg := fmt.Sprintf("Total profit investasi produk %s selesai", product.Name)
+				trx := models.Transaction{
+					UserID:          inv.UserID,
+					Amount:          totalProfit,
+					Charge:          0,
+					OrderID:         orderID,
+					TransactionFlow: "debit",
+					TransactionType: "return",
+					Message:         &msg,
+					Status:          "Success",
+				}
+				if err := tx.Create(&trx).Error; err != nil {
+					return err
+				}
+			}
+
+			// NO TEAM BONUSES - removed completely
+
+			nowTime := time.Now()
+			nextTime := nowTime.Add(24 * time.Hour)
+			updates := map[string]interface{}{"total_paid": paid, "total_returned": returned, "last_return_at": nowTime, "next_return_at": nextTime}
+			if paid >= inv.Duration {
+				updates["status"] = "Completed"
+
+				newBalance := round3(user.Balance + inv.Amount)
+				if err := tx.Model(&user).Update("balance", newBalance).Error; err != nil {
+					return err
+				}
+
+				orderID := utils.GenerateOrderID(inv.UserID)
+				msg := fmt.Sprintf("Pengembalian modal investasi produk %s", product.Name)
+				trx := models.Transaction{
+					UserID:          inv.UserID,
+					Amount:          inv.Amount,
+					Charge:          0,
+					OrderID:         orderID,
+					TransactionFlow: "debit",
+					TransactionType: "return",
+					Message:         &msg,
+					Status:          "Success",
+				}
+				if err := tx.Create(&trx).Error; err != nil {
+					return err
+				}
+			}
+			if err := tx.Model(&inv).Updates(updates).Error; err != nil {
+				return err
+			}
+			processed++
+			return nil
+		})
+	}
+	utils.WriteJSON(w, http.StatusOK, utils.APIResponse{Success: true, Message: "Cron executed", Data: map[string]interface{}{"processed": processed}})
+}
+
+// POST /v3/cron/expired-handlers
+func ExpiredPaymentsHandler(w http.ResponseWriter, r *http.Request) {
+	key := r.Header.Get("X-CRON-KEY")
+	if key == "" || key != os.Getenv("CRON_KEY") {
+		utils.WriteJSON(w, http.StatusUnauthorized, utils.APIResponse{Success: false, Message: "Unauthorized"})
+		return
+	}
+
+	db := database.DB
+	now := time.Now()
+
+	// Find all payments that are expired (expired_at <= now) and still Pending
+	var expiredPayments []models.Payment
+	if err := db.Where("status = ? AND expired_at IS NOT NULL AND expired_at <= ?", "Pending", now).Find(&expiredPayments).Error; err != nil {
+		utils.WriteJSON(w, http.StatusInternalServerError, utils.APIResponse{Success: false, Message: "Terjadi kesalahan"})
+		return
+	}
+
+	processed := 0
+	for i := range expiredPayments {
+		payment := expiredPayments[i]
+
+		// Update payment, investment, and transaction in a transaction
+		err := db.Transaction(func(tx *gorm.DB) error {
+			// Update payment status to Expired
+			if err := tx.Model(&models.Payment{}).Where("id = ?", payment.ID).Update("status", "Expired").Error; err != nil {
+				return err
+			}
+
+			// Get investment by order_id
+			var investment models.Investment
+			if err := tx.Where("order_id = ?", payment.OrderID).First(&investment).Error; err != nil {
+				// If investment not found, continue (payment might be orphaned)
+				return nil
+			}
+
+			// Update investment status to Cancelled (only if still Pending)
+			if investment.Status == "Pending" {
+				if err := tx.Model(&models.Investment{}).Where("id = ?", investment.ID).Update("status", "Cancelled").Error; err != nil {
+					return err
+				}
+			}
+
+			// Update transaction status to Failed
+			if err := tx.Model(&models.Transaction{}).Where("order_id = ?", payment.OrderID).Update("status", "Failed").Error; err != nil {
+				// Transaction might not exist, continue anyway
+				return nil
+			}
+
+			processed++
+			return nil
+		})
+
+		if err != nil {
+			// Log error but continue processing other payments
+			continue
+		}
+	}
+
+	utils.WriteJSON(w, http.StatusOK, utils.APIResponse{Success: true, Message: "Cron executed", Data: map[string]interface{}{"processed": processed}})
+}
+
+func parseTimeFlexible(s string) (time.Time, error) {
+	if s == "" {
+		return time.Time{}, errors.New("empty")
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t, nil
+	}
+	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+		return t, nil
+	}
+	if t, err := time.Parse("2006-01-02T15:04:05.000Z07:00", s); err == nil {
+		return t, nil
+	}
+	return time.Time{}, fmt.Errorf("cannot parse time: %s", s)
+}
+
+func round3(f float64) float64 {
+	return float64(int(f*100+0.5)) / 100
+}
+
+// calculateVIPLevel determines VIP level based on total locked category investments
+// VIP1: 50k, VIP2: 1.2M, VIP3: 7M, VIP4: 30M, VIP5: 150M
+func calculateVIPLevel(totalInvestVIP float64) uint {
+	if totalInvestVIP >= 150000000 {
+		return 5
+	} else if totalInvestVIP >= 30000000 {
+		return 4
+	} else if totalInvestVIP >= 10000000 {
+		return 3
+	} else if totalInvestVIP >= 1200000 {
+		return 2
+	} else if totalInvestVIP >= 50000 {
+		return 1
+	}
+	return 0
+}

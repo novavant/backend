@@ -1,0 +1,115 @@
+package routes
+
+import (
+	"net/http"
+	"project/controllers"
+	"project/controllers/auth"
+	"project/controllers/users"
+	"project/middleware"
+	"time"
+
+	"github.com/gorilla/mux"
+)
+
+// UsersRoutes mendaftarkan semua route terkait user ke subrouter yang diberikan
+func UsersRoutes(api *mux.Router) {
+	// Active investments by product
+	// Rate limiter login/register: 50 per IP per 5 menit (lebih fleksibel, tetap aman)
+	// Window 5 menit memberikan fleksibilitas lebih untuk penggunaan normal
+	loginLimiter := middleware.NewIPRateLimiter(60, 5*time.Minute)
+	// Rate limiter session: 120 per user per menit (GET), 60 per user per menit (POST/PUT/DELETE)
+	userLimiter := middleware.NewUserRateLimiter(120, 60, 60) // 120 read, 60 write, window 60 detik
+	// Rate limiter untuk chat history: sangat longgar karena sering dipanggil saat polling di room chat
+	chatHistoryLimiter := middleware.NewIPRateLimiter(500, 5*time.Minute) // 500 requests per 5 menit
+
+	// Register & Login
+	api.Handle("/register", loginLimiter.Middleware(http.HandlerFunc(auth.RegisterHandler))).Methods(http.MethodPost)
+	api.Handle("/login", loginLimiter.Middleware(http.HandlerFunc(auth.LoginHandler))).Methods(http.MethodPost)
+	api.Handle("/refresh", loginLimiter.Middleware(http.HandlerFunc(auth.RefreshHandler))).Methods(http.MethodPost)
+	api.Handle("/logout", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(auth.LogoutHandler)))).Methods(http.MethodPost)
+	api.Handle("/logout-all", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(auth.LogoutAllHandler)))).Methods(http.MethodPost)
+
+	// Forgot Password
+	api.Handle("/auth/forgot-password/request-otp", loginLimiter.Middleware(http.HandlerFunc(auth.ForgotPasswordRequestOTPHandler))).Methods(http.MethodPost)
+	api.Handle("/auth/forgot-password/resend-otp", loginLimiter.Middleware(http.HandlerFunc(auth.ForgotPasswordResendOTPHandler))).Methods(http.MethodPost)
+	api.Handle("/auth/forgot-password/verify-otp", loginLimiter.Middleware(http.HandlerFunc(auth.ForgotPasswordVerifyOTPHandler))).Methods(http.MethodPost)
+	api.Handle("/auth/forgot-password/reset-password", loginLimiter.Middleware(http.HandlerFunc(auth.ForgotPasswordResetPasswordHandler))).Methods(http.MethodPost)
+
+	// Change password (write)
+	api.Handle("/users/change-password", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.ChangePasswordHandler)))).Methods(http.MethodPost)
+
+	// User info (read)
+	api.Handle("/users/info", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.InfoHandler)))).Methods(http.MethodGet)
+
+	// User profile (update and delete)
+	api.Handle("/users/profile", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.UpdateProfileHandler)))).Methods(http.MethodPut)
+	api.Handle("/users/profile", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.DeleteProfileHandler)))).Methods(http.MethodDelete)
+
+	// Get Bank List, Add, Edit, Delete
+	api.Handle("/bank", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(controllers.BankListHandler)))).Methods(http.MethodGet)
+	api.Handle("/users/bank", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.AddBankAccountHandler)))).Methods(http.MethodPost)
+	api.Handle("/users/bank", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.GetBankAccountHandler)))).Methods(http.MethodGet)
+	api.Handle("/users/bank/{id}", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.GetBankAccountHandler)))).Methods(http.MethodGet)
+	api.Handle("/users/bank", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.EditBankAccountHandler)))).Methods(http.MethodPut)
+	api.Handle("/users/bank", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.DeleteBankAccountHandler)))).Methods(http.MethodDelete)
+
+	// Public: list products
+	api.Handle("/products", userLimiter.Middleware(http.HandlerFunc(controllers.ProductListHandler))).Methods(http.MethodGet)
+
+	// Investment endpoints (replace deposit flow)
+	api.Handle("/users/investments", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.CreateInvestmentHandler)))).Methods(http.MethodPost)
+	api.Handle("/users/investments", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.ListInvestmentsHandler)))).Methods(http.MethodGet)
+	api.Handle("/users/investments/active", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.GetActiveInvestmentsHandler)))).Methods(http.MethodGet)
+	api.Handle("/users/investments/{id:[0-9]+}", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.GetInvestmentHandler)))).Methods(http.MethodGet)
+
+	// Handle Payments get
+	api.Handle("/users/payments/{order_id}", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.GetPaymentDetailsHandler)))).Methods(http.MethodGet)
+
+	// Protected endpoint: withdrawal request
+	api.Handle("/users/withdrawal", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.WithdrawalHandler)))).Methods(http.MethodPost)
+	api.Handle("/users/withdrawal", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.ListWithdrawalHandler)))).Methods(http.MethodGet)
+
+	// Transfer
+	api.Handle("/transfer/inquiry", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.TransferInquiryHandler)))).Methods(http.MethodPost)
+	api.Handle("/transfer", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.TransferHandler)))).Methods(http.MethodPost)
+	api.Handle("/transfer/contact", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.TransferContactHandler)))).Methods(http.MethodGet)
+
+	// Gift (dana kaget)
+	api.Handle("/gift", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.CreateGiftHandler)))).Methods(http.MethodPost)
+	api.Handle("/gift/redeem", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.RedeemGiftHandler)))).Methods(http.MethodPost)
+	api.Handle("/gift/inquiry", userLimiter.Middleware(http.HandlerFunc(users.GiftInquiryHandler))).Methods(http.MethodGet)
+	api.Handle("/gift/history", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.GiftHistoryHandler)))).Methods(http.MethodGet)
+	api.Handle("/gift/wins", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.GiftWinsHandler)))).Methods(http.MethodGet)
+	api.Handle("/gift/{id:[0-9]+}/winners", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.GiftWinnersHandler)))).Methods(http.MethodGet)
+
+	// Spin endpoints
+	api.Handle("/spin-prize-list", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.SpinPrizeListHandler)))).Methods(http.MethodGet)
+	api.Handle("/users/spin", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.UserSpinHandler)))).Methods(http.MethodPost)
+	//api.Handle("/users/spin-v2", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.UserSpinHandler)))).Methods(http.MethodGet)
+
+	api.Handle("/users/transaction", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.GetTransactionHistory)))).Methods(http.MethodGet)
+	api.Handle("/users/transaction/{type}", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.GetTransactionHistory)))).Methods(http.MethodGet)
+
+	api.Handle("/users/team-invited", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.TeamInvitedHandler)))).Methods(http.MethodGet)
+	api.Handle("/users/team-invited/{level}", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.TeamInvitedHandler)))).Methods(http.MethodGet)
+	api.Handle("/users/team-data/{level}", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.TeamDataHandler)))).Methods(http.MethodGet)
+
+	api.Handle("/users/forum", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.ForumListHandler)))).Methods(http.MethodGet)
+	api.Handle("/users/check-forum", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.CheckWithdrawalForumHandler)))).Methods(http.MethodGet)
+	api.Handle("/users/forum/submit", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.ForumSubmitHandler)))).Methods(http.MethodPost)
+
+	api.Handle("/users/task", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.TaskListHandler)))).Methods(http.MethodGet)
+	api.Handle("/users/task/submit", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(users.TaskSubmitHandler)))).Methods(http.MethodPost)
+
+	// Live Chat AI endpoints
+	// Start chat (public - no auth required, but can be used with auth)
+	api.Handle("/livechat/start", loginLimiter.Middleware(http.HandlerFunc(controllers.StartChatHandler))).Methods(http.MethodPost)
+	// Send message (public - session-based auth)
+	api.Handle("/livechat/{session_id}/message", loginLimiter.Middleware(http.HandlerFunc(controllers.SendMessageHandler))).Methods(http.MethodPost)
+	// End chat (public - session-based auth)
+	api.Handle("/livechat/{session_id}/end", loginLimiter.Middleware(http.HandlerFunc(controllers.EndChatHandler))).Methods(http.MethodPost)
+	// Get chat history (public - session-based auth) - rate limiter sangat longgar untuk polling
+	api.Handle("/livechat/{session_id}/history", chatHistoryLimiter.Middleware(http.HandlerFunc(controllers.GetChatHistoryHandler))).Methods(http.MethodGet)
+	// Get all chat sessions (auth required - only for authenticated users)
+	api.Handle("/livechat/sessions", userLimiter.Middleware(middleware.AuthMiddleware(http.HandlerFunc(controllers.GetChatSessionsHandler)))).Methods(http.MethodGet)
+}

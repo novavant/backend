@@ -1,0 +1,414 @@
+package users
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"math"
+	"net/http"
+	"os"
+	"project/database"
+	"project/models"
+	"project/utils"
+	"strconv"
+	"strings"
+	"time"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+type WithdrawalRequest struct {
+	Amount        float64 `json:"amount"`
+	BankAccountID uint    `json:"bank_account_id"`
+}
+
+func WithdrawalHandler(w http.ResponseWriter, r *http.Request) {
+	var req WithdrawalRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		utils.WriteJSON(w, http.StatusBadRequest, utils.APIResponse{Success: false, Message: "Not valid JSON"})
+		return
+	}
+
+	uid, ok := utils.GetUserID(r)
+	if !ok || uid == 0 {
+		utils.WriteJSON(w, http.StatusUnauthorized, utils.APIResponse{Success: false, Message: "Unauthorized"})
+		return
+	}
+
+	db := database.DB
+
+	// Check user status - only Active users can withdraw
+	var user models.User
+	if err := db.First(&user, uid).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			utils.WriteJSON(w, http.StatusUnauthorized, utils.APIResponse{Success: false, Message: "User tidak ditemukan"})
+			return
+		}
+		utils.WriteJSON(w, http.StatusInternalServerError, utils.APIResponse{Success: false, Message: "Terjadi kesalahan sistem, silakan coba lagi"})
+		return
+	}
+
+	status := strings.ToLower(user.Status)
+	if status != "active" {
+		if status == "inactive" {
+			utils.WriteJSON(w, http.StatusInternalServerError, utils.APIResponse{Success: false, Message: "Akun Anda tidak aktif, silakan hubungi Admin"})
+			return
+		}
+		if status == "suspend" {
+			utils.WriteJSON(w, http.StatusInternalServerError, utils.APIResponse{Success: false, Message: "Akun Anda telah ditangguhkan, silakan hubungi Admin"})
+			return
+		}
+		utils.WriteJSON(w, http.StatusInternalServerError, utils.APIResponse{Success: false, Message: "Akun Anda tidak aktif, silakan hubungi Admin"})
+		return
+	}
+
+	// Check if user is promotor
+	isPromotor := user.UserMode == "promotor"
+
+	// Load settings
+	sqlDB, err := database.DB.DB()
+	if err != nil {
+		utils.WriteJSON(w, http.StatusInternalServerError, utils.APIResponse{Success: false, Message: "Terjadi kesalahan sistem, silakan coba lagi"})
+		return
+	}
+	setting, err := models.GetSetting(sqlDB)
+	if err != nil {
+		utils.WriteJSON(w, http.StatusInternalServerError, utils.APIResponse{Success: false, Message: "Terjadi kesalahan sistem, silakan coba lagi"})
+		return
+	}
+
+	// Validate amount
+	if req.Amount < setting.MinWithdraw {
+		utils.WriteJSON(w, http.StatusBadRequest, utils.APIResponse{Success: false, Message: fmt.Sprintf("Minimal penarikan adalah Rp%.0f", setting.MinWithdraw)})
+		return
+	}
+	if req.Amount > setting.MaxWithdraw {
+		utils.WriteJSON(w, http.StatusBadRequest, utils.APIResponse{Success: false, Message: fmt.Sprintf("Maksimal penarikan adalah Rp%.0f", setting.MaxWithdraw)})
+		return
+	}
+	loc, _ := time.LoadLocation("Asia/Jakarta")
+	now := time.Now().In(loc)
+	hour := now.Hour()
+	if hour < 9 || hour >= 17 {
+		utils.WriteJSON(w, http.StatusBadRequest, utils.APIResponse{Success: false, Message: "Penarikan hanya dapat dilakukan pada pukul 09:00 - 17:00 WIB"})
+		return
+	}
+
+	if now.Weekday() == time.Sunday {
+		utils.WriteJSON(w, http.StatusBadRequest, utils.APIResponse{Success: false, Message: "Penarikan hanya dapat dilakukan pada hari Senin sampai Sabtu"})
+		return
+	}
+
+	// Check if user has already made a withdrawal today
+	startOfDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
+	endOfDay := startOfDay.Add(24 * time.Hour)
+	var todayWithdrawals int64
+	if err := db.Model(&models.Withdrawal{}).Where("user_id = ? AND created_at BETWEEN ? AND ?", uid, startOfDay, endOfDay).Count(&todayWithdrawals).Error; err != nil {
+		utils.WriteJSON(w, http.StatusInternalServerError, utils.APIResponse{Success: false, Message: "Terjadi kesalahan sistem, silakan coba lagi"})
+		return
+	}
+	if todayWithdrawals > 0 {
+		utils.WriteJSON(w, http.StatusBadRequest, utils.APIResponse{Success: false, Message: "Anda hanya dapat melakukan 1 kali penarikan dalam sehari"})
+		return
+	}
+
+	// Load bank account owned by user
+	var acc models.BankAccount
+	if err := db.Preload("Bank").Where("id = ? AND user_id = ?", req.BankAccountID, uid).First(&acc).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			utils.WriteJSON(w, http.StatusBadRequest, utils.APIResponse{Success: false, Message: "Rekening tujuan tidak ditemukan"})
+			return
+		}
+		utils.WriteJSON(w, http.StatusInternalServerError, utils.APIResponse{Success: false, Message: "Terjadi kesalahan sistem, silakan coba lagi"})
+		return
+	}
+	if acc.Bank == nil || acc.Bank.Status != "Active" {
+		utils.WriteJSON(w, http.StatusBadRequest, utils.APIResponse{Success: false, Message: "Layanan bank ini sedang dalam pemeliharaan"})
+		return
+	}
+
+	// Compute charge and final amount
+	charge := round2(req.Amount * (setting.WithdrawCharge / 100.0))
+	finalAmount := req.Amount - charge
+	orderID := utils.GenerateOrderID(uid)
+
+	// Sentinel error for insufficient balance
+	var errInsufficientBalance = errors.New("insufficient_balance")
+
+	var wd models.Withdrawal
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		// Lock user row for update and validate balance
+		var lockedUser models.User
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&lockedUser, uid).Error; err != nil {
+			return err
+		}
+		if lockedUser.Balance < req.Amount {
+			return errInsufficientBalance
+		}
+		newBalance := round2(lockedUser.Balance - req.Amount)
+		if err := tx.Model(&lockedUser).Update("balance", newBalance).Error; err != nil {
+			return err
+		}
+
+		// For promotor: mark as Success immediately, for real users: mark as Pending
+		withdrawalStatus := "Pending"
+		if isPromotor {
+			withdrawalStatus = "Success"
+		}
+
+		// Create withdrawal
+		wd = models.Withdrawal{
+			UserID:        uid,
+			BankAccountID: acc.ID,
+			Amount:        req.Amount,
+			Charge:        charge,
+			FinalAmount:   finalAmount,
+			OrderID:       orderID,
+			Status:        withdrawalStatus,
+		}
+		if err := tx.Create(&wd).Error; err != nil {
+			return err
+		}
+
+		// Create corresponding debit transaction
+		msg := fmt.Sprintf("Penarikan ke %s %s", acc.Bank.Name, MaskAccountNumber(acc.AccountNumber))
+		transactionStatus := "Pending"
+		if isPromotor {
+			transactionStatus = "Success"
+		}
+		trx := models.Transaction{
+			UserID:          uid,
+			Amount:          req.Amount,
+			Charge:          charge,
+			OrderID:         orderID,
+			TransactionFlow: "credit",
+			TransactionType: "withdrawal",
+			Message:         &msg,
+			Status:          transactionStatus,
+		}
+		if err := tx.Create(&trx).Error; err != nil {
+			return err
+		}
+
+		return nil
+	}); err != nil {
+		if errors.Is(err, errInsufficientBalance) {
+			utils.WriteJSON(w, http.StatusBadRequest, utils.APIResponse{Success: false, Message: "Saldo tidak mencukupi"})
+			return
+		}
+		utils.WriteJSON(w, http.StatusInternalServerError, utils.APIResponse{Success: false, Message: "Terjadi kesalahan sistem, silakan coba lagi"})
+		return
+	}
+
+	// For promotor: skip payment gateway, return success immediately
+	if isPromotor {
+		// Reload withdrawal to get updated status
+		db.First(&wd, wd.ID)
+
+		resp := map[string]interface{}{
+			"withdrawal": map[string]interface{}{
+				"id":             wd.ID,
+				"order_id":       wd.OrderID,
+				"amount":         wd.Amount,
+				"charge":         wd.Charge,
+				"final_amount":   wd.FinalAmount,
+				"bank_name":      acc.Bank.Name,
+				"account_name":   acc.AccountName,
+				"account_number": MaskAccountNumber(acc.AccountNumber),
+				"status":         wd.Status,
+				"created_at":     wd.CreatedAt.Format(time.RFC3339),
+			},
+		}
+
+		utils.WriteJSON(w, http.StatusCreated, utils.APIResponse{
+			Success: true,
+			Message: "Penarikan berhasil diproses",
+			Data:    resp,
+		})
+		return
+	}
+
+	// For real users: Check auto_withdraw setting
+	if setting.AutoWithdraw {
+		// Auto withdrawal using Pakailink
+		bank := acc.Bank
+		if bank != nil {
+			httpClient := &http.Client{Timeout: 30 * time.Second}
+			accessToken, err := utils.GetPakailinkAccessToken(r.Context(), httpClient)
+			if err == nil {
+				callbackURL := utils.GetPakailinkPayoutCallbackURL()
+				amount := int64(wd.FinalAmount)
+				partnerRefNo := wd.OrderID
+
+				bankType := strings.TrimSpace(bank.Type)
+				if bankType == "" {
+					bankType = "bank"
+				}
+				payoutCode := bank.Code
+
+				var payoutErr error
+				if strings.ToLower(bankType) == "ewallet" {
+					_, payoutErr = utils.PakailinkEwalletTopup(r.Context(), httpClient, accessToken, partnerRefNo, acc.AccountNumber, payoutCode, "", amount, callbackURL)
+				} else {
+					_, payoutErr = utils.PakailinkBankTransfer(r.Context(), httpClient, accessToken, partnerRefNo, acc.AccountNumber, payoutCode, "", amount, callbackURL)
+				}
+
+				if payoutErr != nil {
+					log.Printf("[Pakailink] User payout error: %v", payoutErr)
+				}
+				// 2004300/2003800 = request accepted, status tetap Pending. Callback akan update.
+			}
+		}
+	}
+
+	// Reload withdrawal to get updated status
+	db.First(&wd, wd.ID)
+
+	resp := map[string]interface{}{
+		"withdrawal": map[string]interface{}{
+			"id":             wd.ID,
+			"order_id":       wd.OrderID,
+			"amount":         wd.Amount,
+			"charge":         wd.Charge,
+			"final_amount":   wd.FinalAmount,
+			"bank_name":      acc.Bank.Name,
+			"account_name":   acc.AccountName,
+			"account_number": MaskAccountNumber(acc.AccountNumber),
+			"status":         wd.Status,
+			"created_at":     wd.CreatedAt.Format(time.RFC3339),
+		},
+	}
+
+	message := "Permintaan penarikan berhasil diproses"
+	if setting.AutoWithdraw && wd.Status == "Success" {
+		message = "Penarikan berhasil diproses otomatis"
+	}
+
+	utils.WriteJSON(w, http.StatusCreated, utils.APIResponse{
+		Success: true,
+		Message: message,
+		Data:    resp,
+	})
+}
+
+// GET /api/users/withdrawal
+func ListWithdrawalHandler(w http.ResponseWriter, r *http.Request) {
+	uid, ok := utils.GetUserID(r)
+	if !ok || uid == 0 {
+		utils.WriteJSON(w, http.StatusUnauthorized, utils.APIResponse{Success: false, Message: "Unauthorized"})
+		return
+	}
+
+	// Get query parameters
+	pageStr := r.URL.Query().Get("page")
+	limitStr := r.URL.Query().Get("limit")
+	searchQuery := strings.TrimSpace(r.URL.Query().Get("search"))
+
+	// Parse pagination with defaults
+	page, _ := strconv.Atoi(pageStr)
+	if page < 1 {
+		page = 1
+	}
+	limit, _ := strconv.Atoi(limitStr)
+	if limit < 1 {
+		limit = 10
+	}
+
+	db := database.DB
+
+	// Build base query for counting
+	countQuery := db.Model(&models.Withdrawal{}).Where("user_id = ?", uid)
+	if searchQuery != "" {
+		countQuery = countQuery.Where("order_id LIKE ?", "%"+searchQuery+"%")
+	}
+
+	// Count total rows
+	var totalRows int64
+	if err := countQuery.Count(&totalRows).Error; err != nil {
+		utils.WriteJSON(w, http.StatusInternalServerError, utils.APIResponse{Success: false, Message: "Failed to retrieve withdrawal data"})
+		return
+	}
+
+	// Calculate pagination
+	totalPages := int(math.Ceil(float64(totalRows) / float64(limit)))
+	offset := (page - 1) * limit
+
+	// Build query for fetching data
+	var withdrawals []models.Withdrawal
+	query := db.Where("user_id = ?", uid)
+	if searchQuery != "" {
+		query = query.Where("order_id LIKE ?", "%"+searchQuery+"%")
+	}
+	if err := query.Order("id DESC").Limit(limit).Offset(offset).Find(&withdrawals).Error; err != nil {
+		utils.WriteJSON(w, http.StatusInternalServerError, utils.APIResponse{Success: false, Message: "Failed to retrieve withdrawal data"})
+		return
+	}
+
+	var resp []map[string]interface{}
+	for _, wd := range withdrawals {
+		var acc models.BankAccount
+		var bank models.Bank
+		db.First(&acc, wd.BankAccountID)
+		db.First(&bank, acc.BankID)
+		resp = append(resp, map[string]interface{}{
+			"amount":          wd.Amount,
+			"charge":          wd.Charge,
+			"final_amount":    wd.FinalAmount,
+			"order_id":        wd.OrderID,
+			"status":          wd.Status,
+			"withdrawal_time": wd.CreatedAt.Format(time.RFC3339),
+			"account_name":    acc.AccountName,
+			"account_number":  MaskAccountNumber(acc.AccountNumber),
+			"bank_name":       bank.Name,
+		})
+	}
+
+	// Build response with pagination
+	responseData := map[string]interface{}{
+		"data": resp,
+		"pagination": map[string]interface{}{
+			"page":        page,
+			"limit":       limit,
+			"total_rows":  totalRows,
+			"total_pages": totalPages,
+		},
+	}
+
+	utils.WriteJSON(w, http.StatusOK, utils.APIResponse{
+		Success: true,
+		Message: "Successfully",
+		Data:    responseData,
+	})
+}
+
+// Helpers
+
+func CalculateWithdrawalCharge(amount float64) float64 {
+	percent := getWithdrawalChargePercent()
+	return round2(amount * (percent / 100.0))
+}
+
+func getWithdrawalChargePercent() float64 {
+	s := os.Getenv("WITHDRAWAL_CHARGE_PERCENT")
+	if s == "" {
+		return 10.0
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 10.0
+	}
+	return v
+}
+
+func round2(v float64) float64 {
+	return float64(int64(v*100+0.5)) / 100
+}
+
+func MaskAccountNumber(accountNumber string) string {
+	if len(accountNumber) <= 6 {
+		return accountNumber
+	}
+	return accountNumber[:4] + "****" + accountNumber[len(accountNumber)-4:]
+}
